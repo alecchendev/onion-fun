@@ -150,7 +150,7 @@ class Node:
 
 
 def create_payloads(
-    hops: list[Node],
+    hops: list[PublicKey],
     introduction_node_id: PublicKey,
     first_blinding_ephemeral_pubkey: PublicKey,
     blinded_node_ids: list[PublicKey],
@@ -160,7 +160,7 @@ def create_payloads(
 
     # Clear hops
     for i, hop in enumerate(hops[:-1]):
-        payloads.append(Payload(hops[i + 1].node_id()))
+        payloads.append(Payload(hops[i + 1]))
     payloads.append(Payload(introduction_node_id))
 
     # Introduction node
@@ -263,7 +263,7 @@ def create_onion_payloads(
 
 
 def create_blinded_route_keys(
-    first_ephemeral_key: PrivateKey, hops: list[Node]
+    first_ephemeral_key: PrivateKey, hops: list[PublicKey]
 ) -> list[tuple[bytes, bytes]]:
     keys = []
 
@@ -272,7 +272,7 @@ def create_blinded_route_keys(
 
     for i, hop in enumerate(hops):
         # Shared secret (for blinding): ss(i) = >>>H(N(i) * e(i))<<< = H(k(i) * E(i))
-        ss = hop.node_id().ecdh(ephemeral_key.private_key)
+        ss = hop.ecdh(ephemeral_key.private_key)
 
         blinding_factor = create_blinded_node_id_factor(ss)
 
@@ -289,7 +289,7 @@ def create_blinded_route_keys(
 
 
 def create_blinded_route(
-    hops: list[Node],
+    hops: list[PublicKey],
 ) -> tuple[PublicKey, list[PublicKey], list[bytes], bytes]:
     blinded_node_ids = []
     encrypted_datas = []
@@ -302,13 +302,13 @@ def create_blinded_route(
 
     datas_to_encrypt = []
     for i, hop in enumerate(hops[:-1]):
-        datas_to_encrypt.append(EncryptedData(next_node_id=hops[i + 1].node_id()))
+        datas_to_encrypt.append(EncryptedData(next_node_id=hops[i + 1]))
     datas_to_encrypt.append(EncryptedData(secret=secret))
 
     for hop, (data_to_encrypt, (blinding_factor, rho)) in zip(
         hops, zip(datas_to_encrypt, keys)
     ):
-        blinded_node_id = hop.node_id().tweak_mul(blinding_factor)
+        blinded_node_id = hop.tweak_mul(blinding_factor)
         blinded_node_ids.append(blinded_node_id)
 
         cipher = ChaCha20_Poly1305.new(key=rho, nonce=bytes(12))
@@ -320,12 +320,12 @@ def create_blinded_route(
 
 def create_onion_packet(
     first_blinding_ephemeral_pubkey: PublicKey,
-    hops: list[Node],
+    hops: list[PublicKey],
     intoduction_node_id: PublicKey,
     blinded_node_ids: list[PublicKey],
     encrypted_datas: list[bytes],
 ) -> OnionPacket:
-    route = [hop.node_id() for hop in hops] + [intoduction_node_id] + blinded_node_ids
+    route = hops + [intoduction_node_id] + blinded_node_ids
 
     # Get keys
     onion_keys, first_ephemeral_pubkey = create_onion_keys(route)
@@ -463,8 +463,8 @@ class TestOnion(unittest.TestCase):
         nodes = [Node() for _ in range(5)]
 
         # Create a blinded route from nodes 2-4
-        blind_hops = [nodes[2], nodes[3], nodes[4]]
-        introduction_node = blind_hops[0]
+        blind_hops = [node.node_id() for node in nodes[2:5]]
+        introduction_node_id = blind_hops[0]
         (
             first_ephemeral_key,
             blinded_node_ids,
@@ -476,11 +476,11 @@ class TestOnion(unittest.TestCase):
 
         # Node 0 creates onion to route from self, through introduction node,
         # through blinded route
-        clear_hops = [nodes[1]]
+        clear_hops = [nodes[1].node_id()]
         onion_packet = create_onion_packet(
             first_ephemeral_key,
             clear_hops,
-            introduction_node.node_id(),
+            introduction_node_id,
             blinded_node_ids[1:],  # skip introduction node
             encrypted_datas,
         )
