@@ -1,9 +1,10 @@
-from secp256k1 import PrivateKey, PublicKey
-import unittest
-import hmac
 from hashlib import sha256
-from Crypto.Cipher import ChaCha20_Poly1305
+import hmac
+import unittest
 import os
+
+from secp256k1 import PrivateKey, PublicKey
+from Crypto.Cipher import ChaCha20_Poly1305
 
 
 class OnionPacket:
@@ -221,6 +222,31 @@ def create_onion_payloads(
 
     return encrypted_payloads, hmac_res
 
+def create_blinded_route_keys(first_ephemeral_key: PrivateKey, hops: list[PublicKey]) -> list[tuple[bytes, bytes]]:
+    keys = []
+
+    ephemeral_key = first_ephemeral_key
+    ephemeral_pubkey = ephemeral_key.pubkey
+
+    for i, hop in enumerate(hops):
+        # Shared secret (for blinding): ss(i) = >>>H(N(i) * e(i))<<< = H(k(i) * E(i))
+        ss = hop.node_id().ecdh(ephemeral_key.private_key)
+
+        # Blinded node id: B(i) = HMAC256("blinded_node_id", ss(i)) * N(i)
+        blinding_factor = hmac.new(b"blinded_node_id", ss, sha256).digest()
+
+        # rho(i) = HMAC256("rho", ss(i))
+        rho = hmac.new(b"rho", ss, sha256).digest()
+        keys.append((blinding_factor, rho))
+
+        # e(i+1) = SHA256(E(i) || ss(i)) * e(i)
+        ephemeral_key = PrivateKey(
+            ephemeral_key.tweak_mul(sha256(ephemeral_pubkey.serialize() + ss).digest())
+        )
+        ephemeral_pubkey = ephemeral_key.pubkey
+
+    return keys
+
 
 def create_blinded_route(
     hops: list[PublicKey],
@@ -230,43 +256,23 @@ def create_blinded_route(
 
     secret = os.urandom(33)
     ephemeral_key = PrivateKey()
-    ephemeral_pubkey = ephemeral_key.pubkey
+    first_ephemeral_pubkey = ephemeral_key.pubkey
 
-    # First ephemeral pubkey is returned for use by sender
-    first_ephemeral_pubkey = ephemeral_pubkey
+    keys = create_blinded_route_keys(ephemeral_key, hops)
 
-    for i, hop in enumerate(hops):
-        # Shared secret: ss(i) = >>>H(N(i) * e(i))<<< = H(k(i) * E(i))
-        ss = hop.node_id().ecdh(ephemeral_key.private_key)
+    datas_to_encrypt = []
+    for i, hop in enumerate(hops[:-1]):
+        datas_to_encrypt.append(EncryptedData(next_node_id=hops[i + 1].node_id()))
+    datas_to_encrypt.append(EncryptedData(secret=secret))
 
+    for hop, (data_to_encrypt, (blinding_factor, rho)) in zip(hops, zip(datas_to_encrypt, keys)):
         # Blinded node id: B(i) = HMAC256("blinded_node_id", ss(i)) * N(i)
-        blinded_node_id = hop.node_id().tweak_mul(
-            hmac.new(b"blinded_node_id", ss, sha256).digest()
-        )
+        blinded_node_id = hop.node_id().tweak_mul(blinding_factor)
         blinded_node_ids.append(blinded_node_id)
 
-        # Get data to encrypt
-        data_to_encrypt: EncryptedData
-        is_recipient = i == len(hops) - 1
-        if is_recipient:
-            data_to_encrypt = EncryptedData(secret=secret)
-        else:
-            data_to_encrypt = EncryptedData(next_node_id=hops[i + 1].node_id())
-
-        # Encrypt data
-        # rho(i) = HMAC256("rho", ss(i))
-        rho = hmac.new(b"rho", ss, sha256).digest()
-        encrypted_data = ChaCha20_Poly1305.new(key=rho, nonce=bytes(12)).encrypt(
-            data_to_encrypt.encode()
-        )
+        cipher = ChaCha20_Poly1305.new(key=rho, nonce=bytes(12))
+        encrypted_data = cipher.encrypt(data_to_encrypt.encode())
         encrypted_datas.append(encrypted_data)
-
-        # Compute next ephemeral key
-        # e(i+1) = SHA256(E(i) || ss(i)) * e(i)
-        ephemeral_key = PrivateKey(
-            ephemeral_key.tweak_mul(sha256(ephemeral_pubkey.serialize() + ss).digest())
-        )
-        ephemeral_pubkey = ephemeral_key.pubkey
 
     # Skip the first blinded node id on return because it's the introduction node
     blinded_node_ids = blinded_node_ids[1:]
